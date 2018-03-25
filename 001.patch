@@ -1,0 +1,593 @@
+From e5c0824adf8ad2fa760c2bb77edbc48a3a513c04 Mon Sep 17 00:00:00 2001
+From: Alex Nemeth <alex.nemeth329@gmail.com>
+Date: Fri, 16 Feb 2018 19:32:42 +0200
+Subject: Added optional transparency/blur to menu frames
+
+Summary:
+Added option to set transparency and blur behind menu frames such as right click context menu, toolbar menu, etc.
+Transparency and blur is disabled by default.
+
+Test Plan: {F5680253}
+
+Reviewers: hpereiradacosta, #plasma, colomar, alake
+
+Reviewed By: hpereiradacosta, #plasma
+
+Subscribers: fredrik, alake, januz, abetts, colomar, andreask, zzag, ngraham, plasma-devel
+
+Tags: #plasma, #breeze
+
+Differential Revision: https://phabricator.kde.org/D10170
+---
+ kstyle/CMakeLists.txt                 |   1 +
+ kstyle/breeze.kcfg                    |   9 ++-
+ kstyle/breezeblurhelper.cpp           | 111 ++++++++++++++++++++++++++
+ kstyle/breezeblurhelper.h             |  84 +++++++++++++++++++
+ kstyle/breezestyle.cpp                |  23 +++++-
+ kstyle/breezestyle.h                  |   4 +
+ kstyle/config/breezestyleconfig.cpp   |   6 +-
+ kstyle/config/ui/breezestyleconfig.ui | 146 +++++++++++++++++++++++++++++++++-
+ 8 files changed, 375 insertions(+), 9 deletions(-)
+ create mode 100644 kstyle/breezeblurhelper.cpp
+ create mode 100644 kstyle/breezeblurhelper.h
+
+diff --git a/kstyle/CMakeLists.txt b/kstyle/CMakeLists.txt
+index 6b95c40..7e90a13 100644
+--- a/kstyle/CMakeLists.txt
++++ b/kstyle/CMakeLists.txt
+@@ -128,6 +128,7 @@ set(breeze_PART_SRCS
+     animations/breezewidgetstateengine.cpp
+     animations/breezewidgetstatedata.cpp
+     debug/breezewidgetexplorer.cpp
++    breezeblurhelper.cpp
+     breezeaddeventfilter.cpp
+     breezeframeshadow.cpp
+     breezehelper.cpp
+diff --git a/kstyle/breeze.kcfg b/kstyle/breeze.kcfg
+index bd2cc40..1a20350 100644
+--- a/kstyle/breeze.kcfg
++++ b/kstyle/breeze.kcfg
+@@ -40,7 +40,7 @@
+ 
+   <!-- widget style -->
+   <group name="Style">
+-    
++
+     <!-- animations -->
+     <entry name="AnimationsEnabled" type="Bool">
+       <default>true</default>
+@@ -97,7 +97,7 @@
+     <entry name="ViewDrawFocusIndicator" type="Bool">
+       <default>true</default>
+     </entry>
+-    
++
+     <!-- sliders -->
+     <entry name="SliderDrawTickMarks" type="Bool">
+       <default>true</default>
+@@ -185,6 +185,11 @@
+       <default>false</default>
+     </entry>
+ 
++    <!-- transparency -->
++    <entry name="MenuOpacity" type="Int">
++        <default>100</default>
++    </entry>
++
+   </group>
+ 
+ </kcfg>
+diff --git a/kstyle/breezeblurhelper.cpp b/kstyle/breezeblurhelper.cpp
+new file mode 100644
+index 0000000..9000506
+--- /dev/null
++++ b/kstyle/breezeblurhelper.cpp
+@@ -0,0 +1,111 @@
++//////////////////////////////////////////////////////////////////////////////
++// breezeblurhelper.cpp
++// handle regions passed to kwin for blurring
++// -------------------
++//
++// Copyright (C) 2018 Alex Nemeth <alex.nemeth329@gmail.com>
++//
++// Largely rewritten from Oxygen widget style
++// Copyright (C) 2007 Thomas Luebking <thomas.luebking@web.de>
++// Copyright (c) 2010 Hugo Pereira Da Costa <hugo.pereira@free.fr>
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to
++// deal in the Software without restriction, including without limitation the
++// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++// sell copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++// IN THE SOFTWARE.
++//////////////////////////////////////////////////////////////////////////////
++
++#include "breezeblurhelper.h"
++#include "breezestyleconfigdata.h"
++
++#include <KWindowEffects>
++
++#include <QEvent>
++#include <QVector>
++
++namespace Breeze
++{
++    //___________________________________________________________
++    BlurHelper::BlurHelper(QObject* parent):
++        QObject(parent)
++    {
++    }
++
++    //___________________________________________________________
++    void BlurHelper::registerWidget(QWidget* widget)
++    {
++        // install event filter
++        addEventFilter(widget);
++
++        // schedule shadow area repaint
++        update(widget);
++    }
++
++    //___________________________________________________________
++    void BlurHelper::unregisterWidget(QWidget* widget)
++    {
++        // remove event filter
++        widget->removeEventFilter(this);
++    }
++
++    //___________________________________________________________
++    bool BlurHelper::eventFilter(QObject* object, QEvent* event)
++    {
++        switch (event->type()) {
++            case QEvent::Hide:
++            case QEvent::Show:
++            case QEvent::Resize:
++            {
++                // cast to widget and check
++                QWidget* widget(qobject_cast<QWidget*>(object));
++
++                if (!widget)
++                    break;
++
++                update(widget);
++                break;
++            }
++
++            default: break;
++        }
++
++        // never eat events
++        return false;
++    }
++
++    //___________________________________________________________
++    void BlurHelper::update(QWidget* widget) const
++    {
++        #if BREEZE_HAVE_X11
++        /*
++        directly from bespin code. Supposibly prevent playing with some 'pseudo-widgets'
++        that have winId matching some other -random- window
++        */
++        if (!(widget->testAttribute(Qt::WA_WState_Created) || widget->internalWinId()))
++            return;
++
++        KWindowEffects::enableBlurBehind(widget->winId(), true);
++
++        // force update
++        if (widget->isVisible()) {
++            widget->update();
++        }
++
++        #else
++        Q_UNUSED( widget )
++        #endif
++    }
++}
+diff --git a/kstyle/breezeblurhelper.h b/kstyle/breezeblurhelper.h
+new file mode 100644
+index 0000000..1fb5e93
+--- /dev/null
++++ b/kstyle/breezeblurhelper.h
+@@ -0,0 +1,84 @@
++#ifndef breezeblurhelper_h
++#define breezeblurhelper_h
++
++//////////////////////////////////////////////////////////////////////////////
++// breezeblurhelper.h
++// handle regions passed to kwin for blurring
++// -------------------
++//
++// Copyright (C) 2018 Alex Nemeth <alex.nemeth329@gmail.com>
++//
++// Largely rewritten from Oxygen widget style
++// Copyright (C) 2007 Thomas Luebking <thomas.luebking@web.de>
++// Copyright (c) 2010 Hugo Pereira Da Costa <hugo.pereira@free.fr>
++//
++// Permission is hereby granted, free of charge, to any person obtaining a copy
++// of this software and associated documentation files (the "Software"), to
++// deal in the Software without restriction, including without limitation the
++// rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
++// sell copies of the Software, and to permit persons to whom the Software is
++// furnished to do so, subject to the following conditions:
++//
++// The above copyright notice and this permission notice shall be included in
++// all copies or substantial portions of the Software.
++//
++// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++// IN THE SOFTWARE.
++//////////////////////////////////////////////////////////////////////////////
++
++#include "breeze.h"
++#include "breezehelper.h"
++
++#include <QHash>
++#include <QObject>
++
++#if BREEZE_HAVE_X11
++#include <xcb/xcb.h>
++#endif
++
++namespace Breeze
++{
++    class BlurHelper: public QObject
++    {
++        Q_OBJECT
++
++        public:
++
++        //! constructor
++        BlurHelper( QObject* );
++
++        //! destructor
++        virtual ~BlurHelper( void )
++        {}
++
++        //! register widget
++        void registerWidget( QWidget* );
++
++        //! register widget
++        void unregisterWidget( QWidget* );
++
++        //! event filter
++        bool eventFilter( QObject*, QEvent* ) ;
++
++        protected:
++
++        //! install event filter to object, in a unique way
++        void addEventFilter( QObject* object )
++        {
++            object->removeEventFilter( this );
++            object->installEventFilter( this );
++        }
++
++        //! update blur regions for given widget
++        void update( QWidget* ) const;
++
++    };
++
++}
++
++#endif
+diff --git a/kstyle/breezestyle.cpp b/kstyle/breezestyle.cpp
+index ea3fceb..cb0d3e8 100644
+--- a/kstyle/breezestyle.cpp
++++ b/kstyle/breezestyle.cpp
+@@ -30,6 +30,7 @@
+ #include "breezestyleconfigdata.h"
+ #include "breezewidgetexplorer.h"
+ #include "breezewindowmanager.h"
++#include "breezeblurhelper.h"
+ 
+ #include <KColorUtils>
+ 
+@@ -152,6 +153,7 @@ namespace Breeze
+         , _helper( new Helper( "breeze" ) )
+         #else
+         , _helper( new Helper( StyleConfigData::self()->sharedConfig() ) )
++        , _blurHelper( new BlurHelper( this ) )
+         #endif
+ 
+         , _shadowHelper( new ShadowHelper( this, *_helper ) )
+@@ -317,6 +319,12 @@ namespace Breeze
+ 
+             setTranslucentBackground( widget );
+ 
++            #if !BREEZE_USE_KDE4
++            if ( _helper->hasAlphaChannel( widget ) && StyleConfigData::menuOpacity() < 100 ) {
++                _blurHelper->registerWidget( widget->window() );
++            }
++            #endif
++
+         #if QT_VERSION >= 0x050000
+         } else if( qobject_cast<QCommandLinkButton*>( widget ) ) {
+ 
+@@ -439,6 +447,10 @@ namespace Breeze
+         _windowManager->unregisterWidget( widget );
+         _splitterFactory->unregisterWidget( widget );
+ 
++        #if !BREEZE_USE_KDE4
++        _blurHelper->unregisterWidget( widget );
++        #endif
++
+         // remove event filter
+         if( qobject_cast<QAbstractScrollArea*>( widget ) ||
+             qobject_cast<QDockWidget*>( widget ) ||
+@@ -3609,7 +3621,6 @@ namespace Breeze
+     //___________________________________________________________________________________
+     bool Style::drawPanelMenuPrimitive( const QStyleOption* option, QPainter* painter, const QWidget* widget ) const
+     {
+-
+         /*
+          * do nothing if menu is embedded in another widget
+          * this corresponds to having a transparent background
+@@ -3617,10 +3628,16 @@ namespace Breeze
+         if( widget && !widget->isWindow() ) return true;
+ 
+         const auto& palette( option->palette );
+-        const auto background( _helper->frameBackgroundColor( palette ) );
+         const auto outline( _helper->frameOutlineColor( palette ) );
+-
+         const bool hasAlpha( _helper->hasAlphaChannel( widget ) );
++        auto background( _helper->frameBackgroundColor( palette ) );
++
++        #if !BREEZE_USE_KDE4
++        if ( hasAlpha ) {
++            background.setAlphaF(StyleConfigData::menuOpacity() / 100.0);
++        }
++        #endif
++
+         _helper->renderMenuFrame( painter, option->rect, background, outline, hasAlpha );
+ 
+         return true;
+diff --git a/kstyle/breezestyle.h b/kstyle/breezestyle.h
+index 12548c9..c9ac122 100644
+--- a/kstyle/breezestyle.h
++++ b/kstyle/breezestyle.h
+@@ -66,6 +66,7 @@ namespace Breeze
+     class SplitterFactory;
+     class WidgetExplorer;
+     class WindowManager;
++    class BlurHelper;
+ 
+     //* convenience typedef for base class
+     #if BREEZE_USE_KDE4
+@@ -497,6 +498,9 @@ namespace Breeze
+         //* keyboard accelerators
+         Mnemonics* _mnemonics = nullptr;
+ 
++        //* blur helper
++        BlurHelper* _blurHelper = nullptr;
++
+         //* window manager
+         WindowManager* _windowManager = nullptr;
+ 
+diff --git a/kstyle/config/breezestyleconfig.cpp b/kstyle/config/breezestyleconfig.cpp
+index ee761ef..6fb5302 100644
+--- a/kstyle/config/breezestyleconfig.cpp
++++ b/kstyle/config/breezestyleconfig.cpp
+@@ -64,6 +64,7 @@ namespace Breeze
+         connect( _scrollBarAddLineButtons, SIGNAL(currentIndexChanged(int)), SLOT(updateChanged()) );
+         connect( _scrollBarSubLineButtons, SIGNAL(currentIndexChanged(int)), SLOT(updateChanged()) );
+         connect( _windowDragMode, SIGNAL(currentIndexChanged(int)), SLOT(updateChanged()) );
++        connect( _menuOpacity, SIGNAL(valueChanged(int)), SLOT(updateChanged()) );
+ 
+     }
+ 
+@@ -84,7 +85,8 @@ namespace Breeze
+         StyleConfigData::setScrollBarSubLineButtons( _scrollBarSubLineButtons->currentIndex() );
+         StyleConfigData::setAnimationsEnabled( _animationsEnabled->isChecked() );
+         StyleConfigData::setAnimationsDuration( _animationsDuration->value() );
+-        StyleConfigData::setWindowDragMode( _windowDragMode->currentIndex()  );
++        StyleConfigData::setWindowDragMode( _windowDragMode->currentIndex() );
++        StyleConfigData::setMenuOpacity( _menuOpacity->value() );
+ 
+         #if BREEZE_USE_KDE4
+         StyleConfigData::self()->writeConfig();
+@@ -147,6 +149,7 @@ namespace Breeze
+         else if( _animationsEnabled->isChecked() != StyleConfigData::animationsEnabled() ) modified = true;
+         else if( _animationsDuration->value() != StyleConfigData::animationsDuration() ) modified = true;
+         else if( _windowDragMode->currentIndex() != StyleConfigData::windowDragMode() ) modified = true;
++        else if( _menuOpacity->value() != StyleConfigData::menuOpacity() ) modified = true;
+ 
+         emit changed(modified);
+ 
+@@ -171,6 +174,7 @@ namespace Breeze
+         _animationsEnabled->setChecked( StyleConfigData::animationsEnabled() );
+         _animationsDuration->setValue( StyleConfigData::animationsDuration() );
+         _windowDragMode->setCurrentIndex( StyleConfigData::windowDragMode() );
++        _menuOpacity->setValue( StyleConfigData::menuOpacity() );
+ 
+     }
+ 
+diff --git a/kstyle/config/ui/breezestyleconfig.ui b/kstyle/config/ui/breezestyleconfig.ui
+index ee33a11..30fb913 100644
+--- a/kstyle/config/ui/breezestyleconfig.ui
++++ b/kstyle/config/ui/breezestyleconfig.ui
+@@ -6,10 +6,16 @@
+    <rect>
+     <x>0</x>
+     <y>0</y>
+-    <width>522</width>
+-    <height>257</height>
++    <width>562</width>
++    <height>264</height>
+    </rect>
+   </property>
++  <property name="sizePolicy">
++   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++    <horstretch>0</horstretch>
++    <verstretch>0</verstretch>
++   </sizepolicy>
++  </property>
+   <layout class="QVBoxLayout" name="verticalLayout_2">
+    <property name="leftMargin">
+     <number>0</number>
+@@ -177,7 +183,7 @@
+           <bool>false</bool>
+          </property>
+          <property name="text">
+-          <string>Anima&amp;tions duration:</string>
++          <string>A&amp;nimations duration:</string>
+          </property>
+          <property name="alignment">
+           <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+@@ -380,6 +386,140 @@
+        </item>
+       </layout>
+      </widget>
++     <widget class="QWidget" name="tab_5">
++      <attribute name="title">
++       <string>Transparency</string>
++      </attribute>
++      <layout class="QGridLayout" name="gridLayout_2">
++       <item row="10" column="1">
++        <spacer name="verticalSpacer_5">
++         <property name="orientation">
++          <enum>Qt::Vertical</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>20</width>
++           <height>40</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++       <item row="1" column="1">
++        <layout class="QHBoxLayout" name="horizontalLayout_2">
++         <item>
++          <widget class="QLabel" name="_menuOpacityTransparentLabel">
++           <property name="text">
++            <string>Transparent</string>
++           </property>
++          </widget>
++         </item>
++         <item>
++          <spacer name="horizontalSpacer_6">
++           <property name="orientation">
++            <enum>Qt::Horizontal</enum>
++           </property>
++           <property name="sizeHint" stdset="0">
++            <size>
++             <width>40</width>
++             <height>20</height>
++            </size>
++           </property>
++          </spacer>
++         </item>
++         <item>
++          <widget class="QLabel" name="_menuOpacityOpaqueLabel">
++           <property name="sizePolicy">
++            <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++             <horstretch>0</horstretch>
++             <verstretch>0</verstretch>
++            </sizepolicy>
++           </property>
++           <property name="text">
++            <string>Opaque</string>
++           </property>
++          </widget>
++         </item>
++        </layout>
++       </item>
++       <item row="7" column="0" colspan="2">
++        <layout class="QHBoxLayout" name="horizontalLayout">
++         <item>
++          <widget class="QLabel" name="_menuGroupDescription">
++           <property name="text">
++            <string>Menu:</string>
++           </property>
++          </widget>
++         </item>
++         <item>
++          <widget class="QSlider" name="_menuOpacity">
++           <property name="minimum">
++            <number>0</number>
++           </property>
++           <property name="maximum">
++            <number>100</number>
++           </property>
++           <property name="singleStep">
++            <number>1</number>
++           </property>
++           <property name="pageStep">
++            <number>10</number>
++           </property>
++           <property name="value">
++            <number>100</number>
++           </property>
++           <property name="orientation">
++            <enum>Qt::Horizontal</enum>
++           </property>
++           <property name="invertedAppearance">
++            <bool>false</bool>
++           </property>
++           <property name="invertedControls">
++            <bool>false</bool>
++           </property>
++           <property name="tickPosition">
++            <enum>QSlider::TicksBelow</enum>
++           </property>
++           <property name="tickInterval">
++            <number>10</number>
++           </property>
++          </widget>
++         </item>
++        </layout>
++       </item>
++       <item row="1" column="0">
++        <spacer name="horizontalSpacer_5">
++         <property name="orientation">
++          <enum>Qt::Horizontal</enum>
++         </property>
++         <property name="sizeType">
++          <enum>QSizePolicy::Fixed</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>40</width>
++           <height>20</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++       <item row="9" column="0" colspan="2">
++        <spacer name="horizontalSpacer_4">
++         <property name="orientation">
++          <enum>Qt::Horizontal</enum>
++         </property>
++         <property name="sizeType">
++          <enum>QSizePolicy::Preferred</enum>
++         </property>
++         <property name="sizeHint" stdset="0">
++          <size>
++           <width>542</width>
++           <height>20</height>
++          </size>
++         </property>
++        </spacer>
++       </item>
++      </layout>
++     </widget>
+     </widget>
+    </item>
+   </layout>
+-- 
+cgit v0.11.2
+
